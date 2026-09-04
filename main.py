@@ -41,13 +41,39 @@ WINDOW = FS * WINDOW_SEC
 STEP = WINDOW // 2  # 50% overlap between windows
 
 
-def load_subject(pkl_path):
+import neurokit2 as nk
+
+
+def load_subject(pkl_path, fs=FS):
     with open(pkl_path, "rb") as f:
         data = pickle.load(f, encoding="latin1")
-    ecg = data["signal"]["chest"]["ECG"].squeeze()
-    eda = data["signal"]["chest"]["EDA"].squeeze()
+    raw_ecg = data["signal"]["chest"]["ECG"].squeeze()
+    raw_eda = data["signal"]["chest"]["EDA"].squeeze()
     label = data["label"].squeeze()
-    return ecg, eda, label
+
+    # Run NeuroKit2 ONCE on the full continuous subject signal (not per-window
+    # — R-peak detection and tonic/phasic decomposition both need enough
+    # continuous signal to be reliable; running them on short slices later
+    # would be noisy). Both calls return time series the same length as the
+    # input, so everything downstream (windowing, rate-encoding) is
+    # unchanged — we're only swapping what feeds into the ECG/EDA channels.
+    try:
+        ecg_signals, _ = nk.ecg_process(raw_ecg, sampling_rate=fs)
+        heart_rate = ecg_signals["ECG_Rate"].to_numpy()
+    except Exception as e:
+        print(f"  [warn] ECG processing failed ({e}); falling back to raw ECG")
+        heart_rate = raw_ecg
+
+    try:
+        eda_signals, _ = nk.eda_process(raw_eda, sampling_rate=fs)
+        eda_phasic = eda_signals["EDA_Phasic"].to_numpy()
+    except Exception as e:
+        print(f"  [warn] EDA processing failed ({e}); falling back to raw EDA")
+        eda_phasic = raw_eda
+
+    # Reuse the existing variable names (ecg, eda) so windows_from_subject()
+    # and everything downstream needs zero changes.
+    return heart_rate, eda_phasic, label
 
 
 def windows_from_subject(ecg, eda, label):
@@ -185,6 +211,8 @@ def train(args):
 
     model = StressSNN(n_bits=args.n_bits)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    best_val_acc = -1.0
+    best_state = None
 
     # Class-weighted loss: without this, the optimizer finds "always predict
     # baseline" (the majority class) as an easy local minimum and never
@@ -225,6 +253,18 @@ def train(args):
             f"val_acc={correct/total:.3f}  preds={pred_counts}  "
             f"out_fire_rate={fire_rate:.4f}"
         )
+        val_acc = correct / total
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            print(f"  -> new best (val_acc={best_val_acc:.3f}), checkpoint saved")
+
+    # Use the BEST checkpoint, not whatever the last epoch happened to be --
+    # training bounces around, so the final epoch is not necessarily the
+    # strongest model.
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"\nLoaded best checkpoint (val_acc={best_val_acc:.3f}) for export")
 
     # ------------------------------------------------------------------
     # 5. Export trained weights + LIF time constants (beta) for the
@@ -249,7 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--wesad_dir", type=str, required=True)
     parser.add_argument("--subjects", nargs="+", default=["S2", "S3", "S4"])
     parser.add_argument("--num_steps", type=int, default=100)
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--n_bits", type=int, default=4)
     args = parser.parse_args()
     train(args)
